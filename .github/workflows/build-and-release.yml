@@ -1,0 +1,161 @@
+name: Build Linux Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build kernel (${{ matrix.target.name }})
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: amd64
+            arch: x86_64
+            image_path: arch/x86/boot/bzImage
+            defconfig: x86_64_defconfig
+          - name: arm64
+            arch: arm64
+            image_path: arch/arm64/boot/Image.gz
+            defconfig: defconfig
+
+    env:
+      LLVM: "1"
+      CCACHE_DIR: ~/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: "true"
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_SLOPPINESS: time_macros
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ----------------------------
+      # Dependencies
+      # ----------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio flex git kmod \
+            libelf-dev libssl-dev \
+            clang llvm lld \
+            pahole rsync \
+            xz-utils zstd \
+            ccache
+
+      # ----------------------------
+      # Restore ccache
+      # ----------------------------
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.target.name }}-${{ hashFiles('**/Makefile', '**/Kconfig', 'config/**') }}
+          restore-keys: |
+            ccache-${{ matrix.target.name }}-
+
+      - name: Prepare ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "max_size = 2.0G" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          ccache -z
+
+      # ----------------------------
+      # Config merge
+      # ----------------------------
+      - name: Generate merged config
+        run: |
+          set -euo pipefail
+
+          ARCH="${{ matrix.target.arch }}"
+
+          make ARCH="$ARCH" LLVM=1 ${{ matrix.target.defconfig }}
+
+          chmod +x ./scripts/kconfig/merge_config.sh
+          ./scripts/kconfig/merge_config.sh -m .config \
+            config/config \
+            config/${{ matrix.target.name }}/config
+
+          make ARCH="$ARCH" LLVM=1 olddefconfig
+
+      # ----------------------------
+      # Build kernel (ccache enabled)
+      # ----------------------------
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+
+          export CC="ccache clang"
+          export CXX="ccache clang++"
+
+          make -j"$(nproc)" \
+            ARCH="${{ matrix.target.arch }}" \
+            LLVM=1
+
+          ccache -s
+
+      # ----------------------------
+      # Modules
+      # ----------------------------
+      - name: Install modules
+        run: |
+          set -euo pipefail
+
+          rm -rf out-modules
+          mkdir -p out-modules
+
+          make ARCH="${{ matrix.target.arch }}" LLVM=1 \
+            INSTALL_MOD_PATH="$PWD/out-modules" \
+            modules_install
+
+      # ----------------------------
+      # Package outputs
+      # ----------------------------
+      - name: Package outputs
+        run: |
+          set -euo pipefail
+
+          ARCH_NAME="${{ matrix.target.name }}"
+          IMAGE_PATH="${{ matrix.target.image_path }}"
+
+          test -f "$IMAGE_PATH"
+
+          cp "$IMAGE_PATH" "kernel-${ARCH_NAME}.img"
+          cp .config "config-${ARCH_NAME}"
+
+          tar -C out-modules -cJf "modules-${ARCH_NAME}.tar.xz" .
+
+      # ----------------------------
+      # Upload artifacts
+      # ----------------------------
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.target.name }}
+          path: |
+            kernel-${{ matrix.target.name }}.img
+            config-${{ matrix.target.name }}
+            modules-${{ matrix.target.name }}.tar.xz
+
+      # ----------------------------
+      # Create release (only on tags)
+      # ----------------------------
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kernel-${{ matrix.target.name }}.img
+            config-${{ matrix.target.name }}
+            modules-${{ matrix.target.name }}.tar.xz
