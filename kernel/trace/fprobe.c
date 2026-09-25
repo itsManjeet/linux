@@ -181,7 +181,7 @@ static inline void read_fprobe_header(unsigned long *stack,
 struct __fprobe_header {
 	struct fprobe *fp;
 	unsigned long size_words;
-} __packed;
+};
 
 #define FPROBE_HEADER_SIZE_IN_LONG	SIZE_IN_LONG(sizeof(struct __fprobe_header))
 
@@ -464,15 +464,8 @@ static bool fprobe_exists_on_hash(unsigned long ip, bool ftrace)
 #ifdef CONFIG_MODULES
 static void fprobe_remove_ips(unsigned long *ips, unsigned int cnt)
 {
-	if (!nr_fgraph_fprobes)
-		__fprobe_graph_unregister();
-	else if (cnt)
-		ftrace_set_filter_ips(&fprobe_graph_ops.ops, ips, cnt, 1, 0);
-
-	if (!nr_ftrace_fprobes)
-		__fprobe_ftrace_unregister();
-	else if (cnt)
-		ftrace_set_filter_ips(&fprobe_ftrace_ops, ips, cnt, 1, 0);
+	fprobe_graph_remove_ips(ips, cnt);
+	fprobe_ftrace_remove_ips(ips, cnt);
 }
 #endif
 #else
@@ -613,6 +606,16 @@ static int fprobe_fgraph_entry(struct ftrace_graph_ent *trace, struct fgraph_ops
 			continue;
 
 		data_size = fp->entry_data_size;
+		/*
+		 * The list may have grown since it was sized, so this node
+		 * may not fit. Skip it as missed rather than overrun the
+		 * reservation.
+		 */
+		if (fp->exit_handler &&
+		    used + FPROBE_HEADER_SIZE_IN_LONG + SIZE_IN_LONG(data_size) > reserved_words) {
+			fp->nmissed++;
+			continue;
+		}
 		if (data_size && fp->exit_handler)
 			data = fgraph_data + used + FPROBE_HEADER_SIZE_IN_LONG;
 		else
@@ -942,7 +945,7 @@ int register_fprobe(struct fprobe *fp, const char *filter, const char *notfilter
 	if (num < 0)
 		return num;
 
-	addrs = kcalloc(num, sizeof(*addrs), GFP_KERNEL);
+	addrs = kzalloc_objs(*addrs, num);
 	if (!addrs)
 		return -ENOMEM;
 
@@ -951,10 +954,8 @@ int register_fprobe(struct fprobe *fp, const char *filter, const char *notfilter
 		return -ENOMEM;
 
 	ret = get_ips_from_filter(filter, notfilter, addrs, mods, num);
-	if (ret < 0)
-		return ret;
-
-	ret = register_fprobe_ips(fp, addrs, ret);
+	if (ret >= 0)
+		ret = register_fprobe_ips(fp, addrs, ret);
 
 	for (int i = 0; i < num; i++) {
 		if (mods[i])
@@ -1093,20 +1094,39 @@ static int unregister_fprobe_nolock(struct fprobe *fp)
 }
 
 /**
- * unregister_fprobe() - Unregister fprobe.
+ * unregister_fprobe_async() - Unregister fprobe without RCU GP wait
  * @fp: A fprobe data structure to be unregistered.
  *
  * Unregister fprobe (and remove ftrace hooks from the function entries).
+ * This function will NOT wait until the fprobe is no longer used.
  *
  * Return 0 if @fp is unregistered successfully, -errno if not.
  */
-int unregister_fprobe(struct fprobe *fp)
+int unregister_fprobe_async(struct fprobe *fp)
 {
 	guard(mutex)(&fprobe_mutex);
 	if (!fp || !fprobe_registered(fp))
 		return -EINVAL;
 
 	return unregister_fprobe_nolock(fp);
+}
+
+/**
+ * unregister_fprobe() - Unregister fprobe with RCU GP wait
+ * @fp: A fprobe data structure to be unregistered.
+ *
+ * Unregister fprobe (and remove ftrace hooks from the function entries).
+ * This function will block until the fprobe is no longer used.
+ *
+ * Return 0 if @fp is unregistered successfully, -errno if not.
+ */
+int unregister_fprobe(struct fprobe *fp)
+{
+	int ret = unregister_fprobe_async(fp);
+
+	if (!ret)
+		synchronize_rcu();
+	return ret;
 }
 EXPORT_SYMBOL_GPL(unregister_fprobe);
 

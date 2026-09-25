@@ -48,7 +48,6 @@
 #include <linux/audit.h> /* for audit_free() */
 #include <linux/resource.h>
 #include <linux/task_io_accounting_ops.h>
-#include <linux/blkdev.h>
 #include <linux/task_work.h>
 #include <linux/fs_struct.h>
 #include <linux/init_task.h>
@@ -212,7 +211,12 @@ static void __exit_signal(struct release_task_post *post, struct task_struct *ts
 	__unhash_process(post, tsk, group_dead);
 	write_sequnlock(&sig->stats_lock);
 
-	tsk->sighand = NULL;
+	/*
+	 * Ensure that all preceeding state is visible. Pairs with
+	 * the smp_acquire__after_ctrl_dep() in the sighand == NULL
+	 * path of lock_task_sighand().
+	 */
+	smp_store_release(&tsk->sighand, NULL);
 	spin_unlock(&sighand->siglock);
 
 	__cleanup_sighand(sighand);
@@ -257,8 +261,11 @@ repeat:
 	pidfs_exit(p);
 	cgroup_task_release(p);
 
-	/* Retrieve @thread_pid before __unhash_process() may set it to NULL. */
-	thread_pid = task_pid(p);
+	/*
+	 * Pin @thread_pid before __unhash_process() clears it. The last
+	 * PIDTYPE detach can otherwise free it before proc_flush_pid().
+	 */
+	thread_pid = get_pid(task_pid(p));
 
 	write_lock_irq(&tasklist_lock);
 	ptrace_release_task(p);
@@ -287,20 +294,21 @@ repeat:
 	}
 
 	write_unlock_irq(&tasklist_lock);
-	/* @thread_pid can't go away until free_pids() below */
 	proc_flush_pid(thread_pid);
+	put_pid(thread_pid);
 	exit_cred_namespaces(p);
 	add_device_randomness(&p->se.sum_exec_runtime,
 			      sizeof(p->se.sum_exec_runtime));
 	free_pids(post.pids);
 	release_thread(p);
 	/*
-	 * This task was already removed from the process/thread/pid lists
-	 * and lock_task_sighand(p) can't succeed. Nobody else can touch
-	 * ->pending or, if group dead, signal->shared_pending. We can call
-	 * flush_sigqueue() lockless.
+	 * This task was already removed from the process/thread/pid lists and
+	 * lock_task_sighand(p) can't succeed. If it's the group leader then
+	 * flush tsk->signal->shared_pending. tsk->pending has been flushed
+	 * already in exit_signals(). Nothing else can touch
+	 * signal->shared_pending anymore, so flush_sigqueue() can be invoked
+	 * lockless.
 	 */
-	flush_sigqueue(&p->pending);
 	if (thread_group_leader(p))
 		flush_sigqueue(&p->signal->shared_pending);
 
@@ -543,6 +551,32 @@ void mm_update_next_owner(struct mm_struct *mm)
 }
 #endif /* CONFIG_MEMCG */
 
+#if defined(CONFIG_SCHED_CACHE) && defined(CONFIG_NUMA_BALANCING)
+/*
+ * Subtract the memory footprint of the current task from
+ * mm.
+ */
+static void exit_mm_sched_cache(struct mm_struct *mm)
+{
+	unsigned long fp, sub;
+
+	if (!current->total_numa_faults)
+		return;
+	/*
+	 * No lock protection due to performance considerations.
+	 * Make sure mm->sc_stat.footprint does not become
+	 * negative.
+	 */
+	fp = READ_ONCE(mm->sc_stat.footprint);
+	sub = min(fp, current->total_numa_faults);
+	WRITE_ONCE(mm->sc_stat.footprint, fp - sub);
+}
+#else
+static inline void exit_mm_sched_cache(struct mm_struct *mm)
+{
+}
+#endif /* CONFIG_SCHED_CACHE CONFIG_NUMA_BALANCING */
+
 /*
  * Turn us into a lazy TLB process if we
  * aren't already..
@@ -551,9 +585,12 @@ static void exit_mm(void)
 {
 	struct mm_struct *mm = current->mm;
 
-	exit_mm_release(current, mm);
+	mm_exit_exec_release(current, mm);
 	if (!mm)
 		return;
+
+	exit_mm_sched_cache(mm);
+
 	mmap_read_lock(mm);
 	mmgrab_lazy_tlb(mm);
 	BUG_ON(mm != current->active_mm);
@@ -988,8 +1025,8 @@ void __noreturn do_exit(long code)
 	proc_exit_connector(tsk);
 	mpol_put_task_policy(tsk);
 #ifdef CONFIG_FUTEX
-	if (unlikely(current->pi_state_cache))
-		kfree(current->pi_state_cache);
+	if (unlikely(current->futex.pi_state_cache))
+		kfree(current->futex.pi_state_cache);
 #endif
 	/*
 	 * Make sure we are holding no locks:
@@ -1073,6 +1110,7 @@ void __noreturn make_task_dead(int signr)
 		futex_exit_recursive(tsk);
 		tsk->exit_state = EXIT_DEAD;
 		refcount_inc(&tsk->rcu_users);
+		preempt_disable();
 		do_task_dead();
 	}
 
@@ -1081,7 +1119,7 @@ void __noreturn make_task_dead(int signr)
 
 SYSCALL_DEFINE1(exit, int, error_code)
 {
-	do_exit((error_code&0xff)<<8);
+	do_exit((error_code & 0xff) << 8);
 }
 
 /*
